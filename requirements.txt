@@ -1,0 +1,18 @@
+# ── Web framework ─────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9   # required for FastAPI UploadFile
+
+# ── PDF engine ────────────────────────────────────────────────────────────
+# PyMuPDF ships a self-contained Linux wheel (no system libmupdf needed)
+pymupdf>=1.24.0
+
+# ── Translation providers (free options, pick based on env vars) ──────────
+# GoogleFreeTranslator  → no key needed, but may rate-limit from datacenters
+# GoogleCloudTranslator → set GOOGLE_TRANSLATE_API_KEY (500k chars/month free)
+# DeepLTranslator       → set DEEPL_API_KEY (500k chars/month free)
+deep-translator>=1.11.4
+
+# ── Gradio UI (optional — app works without it, skip to save ~200MB image) ─
+# Uncomment if you want the /  browser UI:
+# gradio>=4.0
