@@ -39,7 +39,7 @@ from typing import Callable, Iterable, Optional, Sequence
 
 import pymupdf as fitz
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 
 DEFAULT_MAX_PAGES = int(os.environ.get("MAX_PAGES", "40"))
 MAX_PAGES_HARD_LIMIT = 200
@@ -500,64 +500,141 @@ def _line_text(line) -> str:
 
 
 def _line_properties(line) -> tuple:
-    sizes, colors, bold = [], [], False
+    sizes, colors, bold, total_chars = [], [], False, 0
+    char_weighted_size = 0.0
     for span in line.get("spans", []):
-        if not span.get("text", "").strip():
+        t = span.get("text", "").strip()
+        if not t:
             continue
         try:
-            sizes.append(float(span.get("size", 0)) or 0.0)
+            sz = float(span.get("size", 0)) or 11.0
         except (TypeError, ValueError):
-            pass
+            sz = 11.0
+        n = len(t)
+        char_weighted_size += sz * n
+        total_chars += n
+        sizes.append(sz)
         colors.append(_int_to_rgb(span.get("color", 0)))
         try:
             if int(span.get("flags", 0)) & 16:
                 bold = True
         except (TypeError, ValueError):
             pass
-    size = max(sizes) if sizes else 11.0
+    size = (char_weighted_size / total_chars) if total_chars else (sizes[0] if sizes else 11.0)
     color = max(set(colors), key=colors.count) if colors else (0, 0, 0)
     return size, color, bold
 
 
-def _block_segments(block) -> list:
-    """Split a block into pieces: one per bullet line, else the whole block."""
-    lines = [line for line in block.get("lines", []) if line.get("bbox")]
-    pairs = [(line, _line_text(line)) for line in lines]
-    pairs = [(line, text) for line, text in pairs if text]
-    if not pairs:
+def _block_segments(block, page_images: Sequence[fitz.Rect] = ()) -> list:
+    """Cluster block lines into logical sub-blocks (headings, bullet points, paragraphs)
+    and clamp bounding boxes away from page images so text never draws over diagrams."""
+    raw_lines = [line for line in block.get("lines", []) if line.get("bbox")]
+    valid_lines = []
+    for line in raw_lines:
+        text = _line_text(line)
+        if text:
+            sz, col, bld = _line_properties(line)
+            valid_lines.append(
+                {
+                    "line": line,
+                    "text": text,
+                    "bbox": fitz.Rect(line["bbox"]),
+                    "size": sz,
+                    "color": col,
+                    "bold": bld,
+                }
+            )
+    if not valid_lines:
         return []
 
-    bullets = [text for _, text in pairs if text[0] in _BULLETS]
-    if len(pairs) >= 2 and len(bullets) == len(pairs):
-        segments = []
-        for line, text in pairs:
-            box = fitz.Rect(line["bbox"])
-            box = fitz.Rect(box.x0, box.y0 - 1.5, box.x1, box.y1 + 1.5)
-            size, color, bold = _line_properties(line)
-            segments.append(
-                (box, text, size, color, bold, [(box.x0 + box.x1) / 2])
-            )
-        return segments
+    clusters: list[list[dict]] = []
+    curr = [valid_lines[0]]
 
-    lines_text = [text for _, text in pairs]
-    text = ""
-    for line in lines_text:
-        if not text:
-            text = line
-        elif text.endswith("-"):
-            text = text[:-1] + line
+    for item in valid_lines[1:]:
+        prev = curr[-1]
+        is_bullet = item["text"][0] in _BULLETS
+        size_diff = abs(item["size"] - prev["size"]) >= 2.5
+        bold_diff = item["bold"] != prev["bold"]
+        vert_gap = item["bbox"].y0 - prev["bbox"].y1
+        line_height = max(item["bbox"].height, prev["bbox"].height)
+        is_big_gap = vert_gap > max(7.0, line_height * 0.55)
+
+        # Title banner across top followed by narrower column body
+        is_title_banner = (
+            prev["bbox"].x1 > 750 and item["bbox"].x1 < 720 and vert_gap > 3.0
+        )
+
+        # Indent jump (sub-bullets or nested items)
+        indent_jump = (item["bbox"].x0 - prev["bbox"].x0) > 20 and is_big_gap
+
+        if (
+            is_bullet
+            or size_diff
+            or (bold_diff and is_big_gap)
+            or is_big_gap
+            or is_title_banner
+            or indent_jump
+        ):
+            clusters.append(curr)
+            curr = [item]
         else:
-            text += " " + line
-    text = _WS_RE.sub(" ", text).strip()
-    size, color, bold = _block_properties(block)
-    line_centers = [
-        (fitz.Rect(line["bbox"]).x0 + fitz.Rect(line["bbox"]).x1) / 2
-        for line in lines
-    ]
-    return [(fitz.Rect(block["bbox"]), text, size, color, bold, line_centers)]
+            curr.append(item)
+    clusters.append(curr)
+
+    segments = []
+    for cl in clusters:
+        x0 = min(item["bbox"].x0 for item in cl)
+        y0 = min(item["bbox"].y0 for item in cl)
+        x1 = max(item["bbox"].x1 for item in cl)
+        y1 = max(item["bbox"].y1 for item in cl)
+        raw_rect = fitz.Rect(x0, y0, x1, y1)
+        draw_rect = fitz.Rect(x0, y0, x1, y1)
+
+        # Smart Image Clamping for drawing
+        for img in page_images:
+            beside_lines = [
+                item
+                for item in cl
+                if item["bbox"].y0 < img.y1 - 2 and item["bbox"].y1 > img.y0 + 2
+            ]
+            if beside_lines:
+                if all(item["bbox"].x1 <= img.x0 + 15 for item in beside_lines):
+                    draw_rect.x1 = min(draw_rect.x1, img.x0 - 4)
+                elif all(item["bbox"].x0 >= img.x1 - 15 for item in beside_lines):
+                    draw_rect.x0 = max(draw_rect.x0, img.x1 + 4)
+
+        combined_text = ""
+        for item in cl:
+            t = item["text"]
+            if not combined_text:
+                combined_text = t
+            elif combined_text.endswith("-"):
+                combined_text = combined_text[:-1] + t
+            else:
+                combined_text += " " + t
+        combined_text = _WS_RE.sub(" ", combined_text).strip()
+
+        total_len = sum(len(item["text"]) for item in cl)
+        avg_size = (
+            sum(item["size"] * len(item["text"]) for item in cl) / max(1, total_len)
+        )
+        bold = any(item["bold"] for item in cl)
+        color = cl[0]["color"]
+        line_centers = [(item["bbox"].x0 + item["bbox"].x1) / 2 for item in cl]
+
+        segments.append(
+            (draw_rect, raw_rect, combined_text, avg_size, color, bold, line_centers)
+        )
+    return segments
 
 
-def _target_rect(rect, above, below, page) -> "fitz.Rect":
+def _target_rect(
+    rect: fitz.Rect,
+    above: Optional[fitz.Rect],
+    below: Optional[fitz.Rect],
+    page: fitz.Page,
+    page_images: Sequence[fitz.Rect] = (),
+) -> fitz.Rect:
     # Room for taller Arabic text, capped so neighbouring boxes never collide.
     top_room = min(4.0, max(0.0, (rect.y0 - above.y1) / 2)) if above else 4.0
     bottom_room = min(4.0, max(0.0, (below.y0 - rect.y1) / 2)) if below else 4.0
@@ -580,35 +657,59 @@ def _target_rect(rect, above, below, page) -> "fitz.Rect":
             target.x0 = max(page.rect.x0 + 18, target.x0 - extra)
         else:
             target.x1 = min(page.rect.x1 - 18, target.x1 + extra)
+
+    # Double-check against page images so expansion never intrudes into pictures
+    for img in page_images:
+        # Beside image: keep target outside image horizontal boundary
+        if target.y0 < img.y1 - 2 and target.y1 > img.y0 + 2:
+            if rect.x1 <= img.x0 + 6:
+                target.x1 = min(target.x1, img.x0 - 4)
+            elif rect.x0 >= img.x1 - 6:
+                target.x0 = max(target.x0, img.x1 + 4)
+        # Above/below image: keep target outside image vertical boundary
+        if target.x0 < img.x1 - 2 and target.x1 > img.x0 + 2:
+            if rect.y1 <= img.y0 + 2:
+                target.y1 = min(target.y1, img.y0 - 2)
+            elif rect.y0 >= img.y1 - 2:
+                target.y0 = max(target.y0, img.y1 + 2)
+
     return target
 
 
 def analyze_page(page, page_index: int) -> PagePlan:
     plan = PagePlan(index=page_index)
     data = page.get_text("dict")
+    page_images: list[fitz.Rect] = []
+    try:
+        for img in page.get_images():
+            for r in page.get_image_rects(img[0]):
+                page_images.append(r)
+    except Exception:
+        pass
+
     raw = []
     for block in data.get("blocks", []):
         if block.get("type") != 0:
             continue
-        for segment in _block_segments(block):
-            rect, text, size, color, bold, line_centers = segment
+        for segment in _block_segments(block, page_images):
+            draw_rect, raw_rect, text, size, color, bold, line_centers = segment
             if len(text) < 3 or not _is_translatable(text):
                 plan.other_text_blocks += 1
                 continue
-            raw.append((rect, text, size, color, bold, line_centers))
+            raw.append((draw_rect, raw_rect, text, size, color, bold, line_centers))
     if not raw:
         return plan
 
     raw.sort(key=lambda item: (round(item[0].y0, 1), item[0].x0))
     page_width = page.rect.width
-    for index, (rect, text, size, color, bold, line_centers) in enumerate(raw):
+    for index, (draw_rect, raw_rect, text, size, color, bold, line_centers) in enumerate(raw):
         above = raw[index - 1][0] if index > 0 else None
         below = raw[index + 1][0] if index + 1 < len(raw) else None
-        target = _target_rect(rect, above, below, page)
+        target = _target_rect(draw_rect, above, below, page, page_images)
 
         align = "right"
-        if rect.width < page_width * 0.8 and line_centers:
-            block_center = (rect.x0 + rect.x1) / 2
+        if draw_rect.width < page_width * 0.8 and line_centers:
+            block_center = (draw_rect.x0 + draw_rect.x1) / 2
             if all(abs(center - block_center) < 6 for center in line_centers):
                 align = "center"
 
@@ -624,7 +725,7 @@ def analyze_page(page, page_index: int) -> PagePlan:
         plan.blocks.append(
             TextBlock(
                 rect=target,
-                redact_rect=rect,
+                redact_rect=raw_rect,
                 text=stripped,
                 size=size,
                 color=color,
