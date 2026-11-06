@@ -39,7 +39,7 @@ from typing import Callable, Iterable, Optional, Sequence
 
 import pymupdf as fitz
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 
 DEFAULT_MAX_PAGES = int(os.environ.get("MAX_PAGES", "40"))
 MAX_PAGES_HARD_LIMIT = 200
@@ -145,7 +145,7 @@ def _css(fonts: dict) -> str:
     rules.append("body { margin: 0; padding: 0; }")
     rules.append(
         "div { direction: rtl; margin: 0; padding: 0; "
-        "line-height: 1.18; overflow-wrap: break-word; }"
+        "line-height: 1.75; overflow-wrap: break-word; }"
     )
     return "\n".join(rules)
 
@@ -646,9 +646,10 @@ def _block_html(block: TextBlock, size: float) -> str:
     r, g, b = block.color
     text = html_mod.escape((block.bullet + " " if block.bullet else "") + block.text)
     weight = "bold" if block.bold else "normal"
+    align_style = "text-align:center;" if block.align == "center" else ""
     return (
         f'<div dir="rtl" style="font-size:{size:.2f}pt;'
-        f"color:rgb({r},{g},{b});text-align:{block.align};"
+        f"color:rgb({r},{g},{b});{align_style}"
         f'font-weight:{weight};">{text}</div>'
     )
 
