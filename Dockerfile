@@ -1,36 +1,23 @@
-# ============================================================================
-# Bilingual PDF Translation Engine — Google Cloud Run
-# ============================================================================
-# Deploy: gcloud run deploy bilingual-pdf --source engine/ --region us-central1
-# ============================================================================
-
 FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=7860
 
 WORKDIR /app
 
-# PyMuPDF wheels on Linux are self-contained, but we need gcc for some deps.
-# We also pre-create the fonts dir so the app can write to it.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python deps (layer cached unless requirements.txt changes) ────────────
-COPY requirements.txt .
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Application ───────────────────────────────────────────────────────────
-COPY app.py .
-RUN mkdir -p /app/fonts
+# Copies app.py and fonts/
+COPY . .
 
-# ── Runtime env ───────────────────────────────────────────────────────────
-ENV PYTHONUNBUFFERED=1
-ENV TMPDIR=/tmp
-ENV ARABIC_FONT_DIR=/app/fonts
-# MAX_PAGES and MAX_UPLOAD_MB can be overridden at deploy time
-ENV MAX_PAGES=40
-ENV MAX_UPLOAD_MB=20
+EXPOSE 7860
 
-# Cloud Run injects PORT=8080; the app reads it automatically.
-EXPOSE 8080
-
+# app.py automatically detects $PORT from environment (Render/HuggingFace/Docker)
 CMD ["python", "app.py"]
