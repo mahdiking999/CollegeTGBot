@@ -39,7 +39,7 @@ from typing import Callable, Iterable, Optional, Sequence
 
 import pymupdf as fitz
 
-VERSION = "3.0.2"
+VERSION = "3.2.0"
 
 DEFAULT_MAX_PAGES = int(os.environ.get("MAX_PAGES", "40"))
 MAX_PAGES_HARD_LIMIT = 200
@@ -951,6 +951,537 @@ def process_pdf(
         out_doc.close()
         src_doc.close()
 
+
+def process_docx(
+    input_path: str,
+    translator: Optional[Translator] = None,
+    output_path: Optional[str] = None,
+    bilingual: bool = True,
+) -> ProcessResult:
+    """Translates a Word document (.docx) to Arabic.
+    If bilingual is True, adds the Arabic translation after each English paragraph / table cell.
+    """
+    started = time.time()
+    try:
+        import docx
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+    except ImportError:
+        raise InputError(
+            "python-docx is not installed. Run `pip install python-docx` to translate Word files."
+        )
+
+    if not os.path.isfile(input_path):
+        raise InputError("The uploaded Word document could not be found.")
+
+    translator = translator or build_translator()
+    doc = docx.Document(input_path)
+
+    def set_p_rtl(p):
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        pPr = p._p.get_or_add_pPr()
+        bidi = pPr.find(qn("w:bidi"))
+        if bidi is None:
+            bidi = OxmlElement("w:bidi")
+            bidi.set(qn("w:val"), "1")
+            pPr.append(bidi)
+        else:
+            bidi.set(qn("w:val"), "1")
+
+    if bilingual:
+        targets = []
+        for p in list(doc.paragraphs):
+            if p.text.strip() and _is_translatable(p.text):
+                targets.append((p, None))
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for p in list(cell.paragraphs):
+                        if p.text.strip() and _is_translatable(p.text):
+                            targets.append((p, cell))
+        for section in doc.sections:
+            for p in list(section.header.paragraphs):
+                if p.text.strip() and _is_translatable(p.text):
+                    targets.append((p, None))
+            for p in list(section.footer.paragraphs):
+                if p.text.strip() and _is_translatable(p.text):
+                    targets.append((p, None))
+
+        texts = [p.text for p, _ in targets]
+        if texts:
+            translated = translator.translate_many(texts)
+            for (p, parent_cell), tr in zip(targets, translated):
+                if parent_cell is not None:
+                    new_p = parent_cell.add_paragraph(tr)
+                else:
+                    new_p = doc.add_paragraph(tr)
+                p._p.addnext(new_p._p)
+                set_p_rtl(new_p)
+                is_bold = any(r.bold for r in p.runs if r.bold is not None)
+                is_italic = any(r.italic for r in p.runs if r.italic is not None)
+                for r in new_p.runs:
+                    r.font.name = "Arial"
+                    if is_bold:
+                        r.bold = True
+                    if is_italic:
+                        r.italic = True
+    else:
+        paragraphs = []
+        for p in doc.paragraphs:
+            if p.text.strip() and _is_translatable(p.text):
+                paragraphs.append(p)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        if p.text.strip() and _is_translatable(p.text):
+                            paragraphs.append(p)
+        for section in doc.sections:
+            for p in section.header.paragraphs:
+                if p.text.strip() and _is_translatable(p.text):
+                    paragraphs.append(p)
+            for p in section.footer.paragraphs:
+                if p.text.strip() and _is_translatable(p.text):
+                    paragraphs.append(p)
+
+        texts = [p.text for p in paragraphs]
+        if texts:
+            translated = translator.translate_many(texts)
+            for p, tr in zip(paragraphs, translated):
+                is_bold = any(r.bold for r in p.runs if r.bold is not None)
+                is_italic = any(r.italic for r in p.runs if r.italic is not None)
+                p.text = tr
+                set_p_rtl(p)
+                for r in p.runs:
+                    r.font.name = "Arial"
+                    if is_bold:
+                        r.bold = True
+                    if is_italic:
+                        r.italic = True
+
+    out = output_path or os.path.join(
+        os.environ.get("TMPDIR") or os.path.dirname(input_path) or ".",
+        f"translated_{uuid.uuid4().hex}.docx",
+    )
+    doc.save(out)
+    return ProcessResult(
+        path=out,
+        source_pages=max(1, len(doc.paragraphs) // 10),
+        output_pages=max(1, len(doc.paragraphs) // (5 if bilingual else 10)),
+        translated_blocks=len(texts),
+        skipped_blocks=0,
+        unfitted_blocks=0,
+        provider=translator.name,
+        seconds=round(time.time() - started, 1),
+        warnings=[],
+    )
+
+
+def process_pptx(
+    input_path: str,
+    translator: Optional[Translator] = None,
+    output_path: Optional[str] = None,
+    bilingual: bool = True,
+) -> ProcessResult:
+    """Translates a PowerPoint presentation (.pptx) to Arabic.
+    If bilingual is True, produces an interleaved presentation:
+    [Slide 1 (Original EN), Slide 1 (Translated AR), Slide 2 (Original EN), Slide 2 (Translated AR), ...]
+    """
+    started = time.time()
+    try:
+        from pptx import Presentation
+        from pptx.enum.text import PP_ALIGN
+        from pptx.opc.package import _Relationship
+        import copy
+    except ImportError:
+        raise InputError(
+            "python-pptx is not installed. Run `pip install python-pptx` to translate PowerPoint files."
+        )
+
+    if not os.path.isfile(input_path):
+        raise InputError("The uploaded PowerPoint file could not be found.")
+
+    translator = translator or build_translator()
+    prs = Presentation(input_path)
+
+    def set_pptx_p_rtl(p):
+        p.alignment = PP_ALIGN.RIGHT
+        pPr = p._p.get_or_add_pPr()
+        pPr.set("rtl", "1")
+
+    def collect_from_shape(shape, p_list):
+        if shape.has_text_frame:
+            for p in shape.text_frame.paragraphs:
+                if p.text.strip() and _is_translatable(p.text):
+                    p_list.append(p)
+        elif shape.has_table:
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    for p in cell.text_frame.paragraphs:
+                        if p.text.strip() and _is_translatable(p.text):
+                            p_list.append(p)
+        elif hasattr(shape, "shapes"):
+            for s in shape.shapes:
+                collect_from_shape(s, p_list)
+
+    if bilingual:
+        orig_slides = list(prs.slides)
+        orig_sldIds = list(prs.slides._sldIdLst)
+        dest_slides = []
+
+        for orig_slide, orig_sldId in zip(orig_slides, orig_sldIds):
+            dest_slide = prs.slides.add_slide(orig_slide.slide_layout)
+            for rId, rel in orig_slide.part.rels.items():
+                if rel.reltype.endswith("/slideLayout"):
+                    continue
+                target = rel.target_ref if rel.is_external else rel.target_part
+                dest_slide.part.rels._rels[rId] = _Relationship(
+                    dest_slide.part.rels._base_uri, rId, rel.reltype, rel.target_mode, target
+                )
+            for sp in list(dest_slide.shapes):
+                sp._element.getparent().remove(sp._element)
+            for sp in orig_slide.shapes:
+                dest_slide.shapes._spTree.append(copy.deepcopy(sp._element))
+
+            dest_sldId = list(prs.slides._sldIdLst)[-1]
+            orig_sldId.addnext(dest_sldId)
+            dest_slides.append(dest_slide)
+
+        paragraphs = []
+        for slide in dest_slides:
+            for shape in slide.shapes:
+                collect_from_shape(shape, paragraphs)
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                for p in slide.notes_slide.notes_text_frame.paragraphs:
+                    if p.text.strip() and _is_translatable(p.text):
+                        paragraphs.append(p)
+
+        texts = [p.text for p in paragraphs]
+        if texts:
+            translated = translator.translate_many(texts)
+            for p, tr in zip(paragraphs, translated):
+                font_size = None
+                is_bold = None
+                is_italic = None
+                if p.runs:
+                    first_run = p.runs[0]
+                    font_size = first_run.font.size
+                    is_bold = first_run.font.bold
+                    is_italic = first_run.font.italic
+
+                p.text = tr
+                set_pptx_p_rtl(p)
+                if p.runs and font_size:
+                    for r in p.runs:
+                        r.font.size = font_size
+                        if is_bold is not None:
+                            r.font.bold = is_bold
+                        if is_italic is not None:
+                            r.font.italic = is_italic
+
+        source_count = len(orig_slides)
+        output_count = len(prs.slides)
+    else:
+        paragraphs = []
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                collect_from_shape(shape, paragraphs)
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                for p in slide.notes_slide.notes_text_frame.paragraphs:
+                    if p.text.strip() and _is_translatable(p.text):
+                        paragraphs.append(p)
+
+        texts = [p.text for p in paragraphs]
+        if texts:
+            translated = translator.translate_many(texts)
+            for p, tr in zip(paragraphs, translated):
+                font_size = None
+                is_bold = None
+                is_italic = None
+                if p.runs:
+                    first_run = p.runs[0]
+                    font_size = first_run.font.size
+                    is_bold = first_run.font.bold
+                    is_italic = first_run.font.italic
+
+                p.text = tr
+                set_pptx_p_rtl(p)
+                if p.runs and font_size:
+                    for r in p.runs:
+                        r.font.size = font_size
+                        if is_bold is not None:
+                            r.font.bold = is_bold
+                        if is_italic is not None:
+                            r.font.italic = is_italic
+
+        source_count = len(prs.slides)
+        output_count = len(prs.slides)
+
+    out = output_path or os.path.join(
+        os.environ.get("TMPDIR") or os.path.dirname(input_path) or ".",
+        f"translated_{uuid.uuid4().hex}.pptx",
+    )
+    prs.save(out)
+    return ProcessResult(
+        path=out,
+        source_pages=source_count,
+        output_pages=output_count,
+        translated_blocks=len(texts),
+        skipped_blocks=0,
+        unfitted_blocks=0,
+        provider=translator.name,
+        seconds=round(time.time() - started, 1),
+        warnings=[],
+    )
+
+
+def process_image(
+    input_path: str,
+    translator: Optional[Translator] = None,
+    output_path: Optional[str] = None,
+    font_dir: Optional[str] = None,
+) -> ProcessResult:
+    """Translates an image (.png, .jpg, .jpeg) using RapidOCR into a 2-page Bilingual PDF:
+    Page 1: Original English image.
+    Page 2: Translated Arabic image with text overlaid in place and RTL alignment.
+    """
+    started = time.time()
+    try:
+        from PIL import Image
+    except ImportError:
+        raise InputError("Pillow is not installed. Run `pip install pillow` to process images.")
+
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        raise InputError(
+            "rapidocr-onnxruntime is not installed. Run `pip install rapidocr-onnxruntime` to perform OCR."
+        )
+
+    if not os.path.isfile(input_path):
+        raise InputError("The uploaded image could not be found.")
+
+    try:
+        pil_img = Image.open(input_path)
+        img_w, img_h = pil_img.size
+    except Exception as exc:
+        raise InputError(f"Could not open image: {exc}")
+
+    translator = translator or build_translator()
+    fonts = ensure_fonts(font_dir)
+    css = _css(fonts)
+    archive = fitz.Archive(os.path.dirname(fonts[FONT_REGULAR]))
+
+    ocr = RapidOCR()
+    results, _ = ocr(input_path)
+
+    blocks = []
+    for box, text, score in (results or []):
+        clean_t = (text or "").strip()
+        if score < 0.4 or not clean_t or not _is_translatable(clean_t):
+            continue
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+        blocks.append({
+            "rect": fitz.Rect(x0, y0, x1, y1),
+            "text": clean_t,
+        })
+
+    texts = [b["text"] for b in blocks]
+    translated = translator.translate_many(texts) if texts else []
+
+    doc = fitz.open()
+    try:
+        # Page 1: Original Image
+        p1 = doc.new_page(width=img_w, height=img_h)
+        p1.insert_image(fitz.Rect(0, 0, img_w, img_h), filename=input_path)
+
+        # Page 2: Arabic Translated Page
+        p2 = doc.new_page(width=img_w, height=img_h)
+        p2.insert_image(fitz.Rect(0, 0, img_w, img_h), filename=input_path)
+
+        unfitted = 0
+        for b, ar_text in zip(blocks, translated):
+            r = b["rect"]
+            # Sample background color around top-left
+            sx = max(0, min(img_w - 1, int(r.x0)))
+            sy = max(0, min(img_h - 1, int(r.y0)))
+            bg_col = pil_img.getpixel((sx, sy))
+            if isinstance(bg_col, int):
+                bg_rgb = (bg_col / 255.0, bg_col / 255.0, bg_col / 255.0)
+            elif len(bg_col) >= 3:
+                bg_rgb = (bg_col[0] / 255.0, bg_col[1] / 255.0, bg_col[2] / 255.0)
+            else:
+                bg_rgb = (1.0, 1.0, 1.0)
+
+            cover = fitz.Rect(
+                max(0, r.x0 - 2), max(0, r.y0 - 2),
+                min(img_w, r.x1 + 2), min(img_h, r.y1 + 2)
+            )
+            p2.draw_rect(cover, color=bg_rgb, fill=bg_rgb)
+
+            font_size = max(9.0, cover.height * 0.72)
+            min_size = max(6.0, font_size * 0.55)
+            tb = TextBlock(
+                rect=cover,
+                text=ar_text.strip() or b["text"],
+                size=round(font_size, 1),
+                min_size=round(min_size, 1),
+                bold=False,
+                color=(0, 0, 0),
+                align="right",
+                redact_rect=cover,
+            )
+            _, fitted = _fit_and_draw(p2, tb, css, archive)
+            if not fitted:
+                unfitted += 1
+
+        out = output_path or os.path.join(
+            os.environ.get("TMPDIR") or os.path.dirname(input_path) or ".",
+            f"bilingual_{uuid.uuid4().hex}.pdf",
+        )
+        doc.save(out, garbage=4, deflate=True)
+        return ProcessResult(
+            path=out,
+            source_pages=1,
+            output_pages=2,
+            translated_blocks=len(texts),
+            skipped_blocks=len(results or []) - len(texts),
+            unfitted_blocks=unfitted,
+            provider=translator.name,
+            seconds=round(time.time() - started, 1),
+            warnings=[],
+        )
+    finally:
+        doc.close()
+
+
+def process_txt(
+    input_path: str,
+    translator: Optional[Translator] = None,
+    output_path: Optional[str] = None,
+) -> ProcessResult:
+    """Translates a plain text file (.txt) to Arabic."""
+    started = time.time()
+    translator = translator or build_translator()
+    with open(input_path, "r", encoding="utf-8", errors="replace") as f:
+        lines = [line.rstrip("\r\n") for line in f]
+
+    indices = [i for i, line in enumerate(lines) if line.strip() and _is_translatable(line)]
+    texts = [lines[i] for i in indices]
+    if texts:
+        translated = translator.translate_many(texts)
+        for i, tr in zip(indices, translated):
+            lines[i] = tr
+
+    out = output_path or os.path.join(
+        os.environ.get("TMPDIR") or os.path.dirname(input_path) or ".",
+        f"translated_{uuid.uuid4().hex}.txt",
+    )
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return ProcessResult(
+        path=out,
+        source_pages=1,
+        output_pages=1,
+        translated_blocks=len(texts),
+        skipped_blocks=len(lines) - len(texts),
+        unfitted_blocks=0,
+        provider=translator.name,
+        seconds=round(time.time() - started, 1),
+        warnings=[],
+    )
+
+
+def _convert_legacy_office(input_path: str) -> Optional[str]:
+    """If LibreOffice (soffice) is available, converts .doc -> .docx or .ppt -> .pptx."""
+    ext = os.path.splitext(input_path)[1].lower()
+    target_format = "docx" if ext == ".doc" else ("pptx" if ext == ".ppt" else None)
+    if not target_format:
+        return input_path
+
+    import shutil
+    import subprocess
+    import tempfile
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        return None
+
+    out_dir = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    cmd = [soffice, "--headless", "--convert-to", target_format, "--outdir", out_dir, input_path]
+    try:
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        base = os.path.splitext(os.path.basename(input_path))[0]
+        converted = os.path.join(out_dir, f"{base}.{target_format}")
+        if os.path.isfile(converted):
+            return converted
+    except Exception:
+        pass
+    return None
+
+
+def process_document(
+    input_path: str,
+    title: Optional[str] = None,
+    translator: Optional[Translator] = None,
+    max_pages: Optional[int] = None,
+    font_dir: Optional[str] = None,
+) -> tuple[ProcessResult, str, str]:
+    """Universal document translation entry point.
+    Returns: (ProcessResult, media_type, suggested_extension)
+    """
+    if not os.path.isfile(input_path):
+        raise InputError("The uploaded file could not be found.")
+
+    ext = os.path.splitext(input_path)[1].lower()
+
+    if ext in (".doc", ".ppt"):
+        converted = _convert_legacy_office(input_path)
+        if not converted:
+            raise InputError(
+                f"الملفات ذات الصيغة القديمة ({ext}) تتطلب حفظها بالصيغة الحديثة (.docx أو .pptx) أو تحويلها إلى PDF قبل إرسالها."
+            )
+        input_path = converted
+        ext = os.path.splitext(input_path)[1].lower()
+
+    if ext == ".pdf":
+        result = process_pdf(
+            input_path, title=title, translator=translator,
+            max_pages=max_pages, font_dir=font_dir
+        )
+        return result, "application/pdf", ".pdf"
+
+    if ext in (".png", ".jpg", ".jpeg"):
+        result = process_image(input_path, translator=translator, font_dir=font_dir)
+        return result, "application/pdf", ".pdf"
+
+    if ext == ".docx":
+        result = process_docx(input_path, translator=translator, bilingual=True)
+        return (
+            result,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".docx",
+        )
+
+    if ext == ".pptx":
+        result = process_pptx(input_path, translator=translator, bilingual=True)
+        return (
+            result,
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".pptx",
+        )
+
+    if ext == ".txt":
+        result = process_txt(input_path, translator=translator)
+        return result, "text/plain; charset=utf-8", ".txt"
+
+    raise InputError(
+        f"Unsupported file format: {ext}. Supported formats are: .pdf, .docx, .pptx, .txt, .png, .jpg, .jpeg, .doc, .ppt"
+    )
+
 # ============================================================================
 # HTTP service (from engine/app.py)
 # ============================================================================
@@ -1084,11 +1615,18 @@ async def translate_endpoint(
     if not _authorised(request):
         return _json_error(401, "unauthorised", "Missing or invalid engine secret.", request_id)
 
-    name = (file.filename or "").lower()
-    if not name.endswith(".pdf"):
-        return _json_error(400, "not_a_pdf", "Please upload a .pdf file.", request_id)
+    orig_name = (file.filename or "").strip()
+    ext = os.path.splitext(orig_name.lower())[1]
+    allowed_exts = (".pdf", ".docx", ".pptx", ".doc", ".ppt", ".txt", ".png", ".jpg", ".jpeg")
+    if ext not in allowed_exts:
+        return _json_error(
+            400,
+            "unsupported_file_type",
+            f"Unsupported file type '{ext}'. Supported formats: {', '.join(allowed_exts)}",
+            request_id,
+        )
 
-    upload_path = os.path.join(tempfile.gettempdir(), f"upload_{uuid.uuid4().hex}.pdf")
+    upload_path = os.path.join(tempfile.gettempdir(), f"upload_{uuid.uuid4().hex}{ext}")
     total = 0
     try:
         with open(upload_path, "wb") as destination:
@@ -1101,7 +1639,7 @@ async def translate_endpoint(
                     return _json_error(
                         413,
                         "too_large",
-                        f"PDF exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
+                        f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
                         request_id,
                     )
                 destination.write(chunk)
@@ -1124,8 +1662,8 @@ async def translate_endpoint(
                 request_id,
             )
         try:
-            result = await asyncio.to_thread(
-                process_pdf,
+            result, media_type, out_ext = await asyncio.to_thread(
+                process_document,
                 upload_path,
                 (title or "").strip() or None,
             )
@@ -1159,16 +1697,19 @@ async def translate_endpoint(
         _delete_file(upload_path)
 
     safe_title = "".join(
-        ch for ch in ((title or "").strip() or "Bilingual_Lecture")
+        ch for ch in ((title or "").strip() or os.path.splitext(orig_name)[0] or "Document")
         if ch.isalnum() or ch in " -_"
-    ).strip()[:80].replace(" ", "_") or "Bilingual_Lecture"
+    ).strip()[:80].replace(" ", "_") or "Document"
+
+    out_suffix = "_EN-AR.pdf" if out_ext == ".pdf" else f"_AR{out_ext}"
+    out_filename = f"{safe_title}{out_suffix}"
 
     log.info(
-        "translated rid=%s pages=%s blocks=%s unfitted=%s provider=%s in %.1fs",
+        "translated rid=%s type=%s pages=%s blocks=%s provider=%s in %.1fs",
         request_id,
+        out_ext.lstrip("."),
         result.output_pages,
         result.translated_blocks,
-        result.unfitted_blocks,
         result.provider,
         time.time() - started,
     )
@@ -1177,14 +1718,15 @@ async def translate_endpoint(
         "X-Engine-Version": VERSION,
         "X-Engine-Request-Id": request_id,
         "X-Engine-Provider": result.provider,
+        "X-Engine-File-Type": out_ext.lstrip("."),
         "X-Engine-Source-Pages": str(result.source_pages),
         "X-Engine-Output-Pages": str(result.output_pages),
         "X-Engine-Warnings": json.dumps(result.warnings, ensure_ascii=True)[:900],
     }
     return FileResponse(
         path=result.path,
-        media_type="application/pdf",
-        filename=f"{safe_title}_EN-AR.pdf",
+        media_type=media_type,
+        filename=out_filename,
         headers=headers,
         background=BackgroundTask(_delete_file, result.path),
     )
