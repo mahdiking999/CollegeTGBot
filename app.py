@@ -1236,6 +1236,60 @@ def process_pptx(
     )
 
 
+def _get_rapidocr():
+    """Dynamically loads RapidOCR with self-healing for headless cloud environments (Render, Docker)."""
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        return RapidOCR
+    except ImportError as e:
+        err_msg = str(e)
+        import subprocess
+        import sys
+
+        # Case 1: Missing libGL.so.1 (OpenCV GUI package in headless Linux environment like Render)
+        if "libgl" in err_msg.lower() or "libgthread" in err_msg.lower() or "libgl.so" in err_msg.lower():
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python"],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--no-cache-dir", "opencv-python-headless"],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                from rapidocr_onnxruntime import RapidOCR
+                return RapidOCR
+            except Exception as fix_err:
+                raise InputError(
+                    f"OpenCV missing libGL.so.1 on server. Auto-repair failed: {fix_err}. "
+                    "Please update requirements.txt with `opencv-python-headless` and redeploy on Render."
+                )
+
+        # Case 2: Package not installed at all in the environment
+        if "no module named" in err_msg.lower() and ("rapidocr" in err_msg.lower() or "cv2" in err_msg.lower()):
+            try:
+                subprocess.run(
+                    [
+                        sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                        "rapidocr-onnxruntime>=1.3.0", "opencv-python-headless>=4.5.1"
+                    ],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python"],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                from rapidocr_onnxruntime import RapidOCR
+                return RapidOCR
+            except Exception as inst_err:
+                raise InputError(
+                    f"rapidocr-onnxruntime is not installed on Render ({inst_err}). "
+                    "Make sure to update requirements.txt on your GitHub repo with: `opencv-python-headless` and `rapidocr-onnxruntime`."
+                )
+
+        raise InputError(f"Could not load OCR engine: {err_msg}")
+
+
 def process_image(
     input_path: str,
     translator: Optional[Translator] = None,
@@ -1252,12 +1306,7 @@ def process_image(
     except ImportError:
         raise InputError("Pillow is not installed. Run `pip install pillow` to process images.")
 
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-    except ImportError:
-        raise InputError(
-            "rapidocr-onnxruntime is not installed. Run `pip install rapidocr-onnxruntime` to perform OCR."
-        )
+    RapidOCR = _get_rapidocr()
 
     if not os.path.isfile(input_path):
         raise InputError("The uploaded image could not be found.")
